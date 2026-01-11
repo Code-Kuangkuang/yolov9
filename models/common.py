@@ -83,6 +83,92 @@ class ADown(nn.Module):
         return torch.cat((x1, x2), 1)
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ECA(nn.Module):
+    """
+    Efficient Channel Attention (ECA)
+    输入/输出 shape: (B, C, H, W) -> (B, C, H, W)
+    """
+    def __init__(self, channels: int, k_size: int | None = None, gamma: int = 2, b: int = 1):
+        super().__init__()
+        if k_size is None:
+            # 论文常用的自适应核大小公式：k = |log2(C)/gamma + b|，再取最近奇数
+            t = int(abs((math.log2(channels) / gamma) + b))
+            k_size = t if t % 2 else t + 1
+            k_size = max(k_size, 3)  # 给个下限，避免太小
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        y = self.avg_pool(x)                 # (B, C, 1, 1)
+        y = y.squeeze(-1).transpose(-1, -2)  # (B, 1, C)
+        y = self.conv(y)                     # (B, 1, C)
+        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)  # (B, C, 1, 1)
+        return x * y
+class CBAMRes(nn.Module):
+    # 这里参数名用 spatial_kernel，和你仓库的 CBAM 对齐
+    def __init__(self, c1, reduction=16, spatial_kernel=7, scale=0.5):
+        super().__init__()
+        self.cbam = CBAM(c1, reduction=reduction, spatial_kernel=spatial_kernel)
+        self.scale = scale
+
+    def forward(self, x):
+        return (x + self.cbam(x)) * self.scale 
+class ChannelAttention(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(channels // reduction, 1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, 1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        avg = torch.mean(x, dim=(2, 3), keepdim=True)          # (B,C,1,1)
+        mx  = torch.amax(x, dim=(2, 3), keepdim=True)          # (B,C,1,1)
+        att = self.mlp(avg) + self.mlp(mx)                     # (B,C,1,1)
+        return x * self.sigmoid(att)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        assert kernel_size in (3, 7), "CBAM spatial kernel usually 3 or 7"
+        padding = (kernel_size - 1) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # avg/max along channel -> (B,1,H,W)
+        avg = torch.mean(x, dim=1, keepdim=True)
+        mx  = torch.amax(x, dim=1, keepdim=True)
+        att = torch.cat([avg, mx], dim=1)                      # (B,2,H,W)
+        att = self.conv(att)                                   # (B,1,H,W)
+        return x * self.sigmoid(att)
+
+
+class CBAM(nn.Module):
+    """
+    CBAM = Channel Attention then Spatial Attention (sequential)
+    """
+    def __init__(self, channels: int, reduction: int = 16, spatial_kernel: int = 7):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction=reduction)
+        self.sa = SpatialAttention(kernel_size=spatial_kernel)
+
+    def forward(self, x):
+        x = self.ca(x)
+        x = self.sa(x)
+        return x
+
 class RepConvN(nn.Module):
     """RepConv is a basic rep-style block, including training and deploy status
     This code is based on https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
@@ -746,112 +832,112 @@ class DetectMultiBackend(nn.Module):
                 batch_size = batch_dim.get_length()
             executable_network = ie.compile_model(network, device_name="CPU")  # device_name="MYRIAD" for Intel NCS2
             stride, names = self._load_metadata(Path(w).with_suffix('.yaml'))  # load metadata
-        elif engine:  # TensorRT
-            LOGGER.info(f'Loading {w} for TensorRT inference...')
-            import tensorrt as trt  # https://developer.nvidia.com/nvidia-tensorrt-download
-            check_version(trt.__version__, '7.0.0', hard=True)  # require tensorrt>=7.0.0
-            if device.type == 'cpu':
-                device = torch.device('cuda:0')
-            Binding = namedtuple('Binding', ('name', 'dtype', 'shape', 'data', 'ptr'))
-            logger = trt.Logger(trt.Logger.INFO)
-            with open(w, 'rb') as f, trt.Runtime(logger) as runtime:
-                model = runtime.deserialize_cuda_engine(f.read())
-            context = model.create_execution_context()
-            bindings = OrderedDict()
-            output_names = []
-            fp16 = False  # default updated below
-            dynamic = False
-            for i in range(model.num_bindings):
-                name = model.get_binding_name(i)
-                dtype = trt.nptype(model.get_binding_dtype(i))
-                if model.binding_is_input(i):
-                    if -1 in tuple(model.get_binding_shape(i)):  # dynamic
-                        dynamic = True
-                        context.set_binding_shape(i, tuple(model.get_profile_shape(0, i)[2]))
-                    if dtype == np.float16:
-                        fp16 = True
-                else:  # output
-                    output_names.append(name)
-                shape = tuple(context.get_binding_shape(i))
-                im = torch.from_numpy(np.empty(shape, dtype=dtype)).to(device)
-                bindings[name] = Binding(name, dtype, shape, im, int(im.data_ptr()))
-            binding_addrs = OrderedDict((n, d.ptr) for n, d in bindings.items())
-            batch_size = bindings['images'].shape[0]  # if dynamic, this is instead max batch size
-        elif coreml:  # CoreML
-            LOGGER.info(f'Loading {w} for CoreML inference...')
-            import coremltools as ct
-            model = ct.models.MLModel(w)
-        elif saved_model:  # TF SavedModel
-            LOGGER.info(f'Loading {w} for TensorFlow SavedModel inference...')
-            import tensorflow as tf
-            keras = False  # assume TF1 saved_model
-            model = tf.keras.models.load_model(w) if keras else tf.saved_model.load(w)
-        elif pb:  # GraphDef https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
-            LOGGER.info(f'Loading {w} for TensorFlow GraphDef inference...')
-            import tensorflow as tf
+        # elif engine:  # TensorRT
+        #     LOGGER.info(f'Loading {w} for TensorRT inference...')
+        #     import tensorrt as trt  # https://developer.nvidia.com/nvidia-tensorrt-download
+        #     check_version(trt.__version__, '7.0.0', hard=True)  # require tensorrt>=7.0.0
+        #     if device.type == 'cpu':
+        #         device = torch.device('cuda:0')
+        #     Binding = namedtuple('Binding', ('name', 'dtype', 'shape', 'data', 'ptr'))
+        #     logger = trt.Logger(trt.Logger.INFO)
+        #     with open(w, 'rb') as f, trt.Runtime(logger) as runtime:
+        #         model = runtime.deserialize_cuda_engine(f.read())
+        #     context = model.create_execution_context()
+        #     bindings = OrderedDict()
+        #     output_names = []
+        #     fp16 = False  # default updated below
+        #     dynamic = False
+        #     for i in range(model.num_bindings):
+        #         name = model.get_binding_name(i)
+        #         dtype = trt.nptype(model.get_binding_dtype(i))
+        #         if model.binding_is_input(i):
+        #             if -1 in tuple(model.get_binding_shape(i)):  # dynamic
+        #                 dynamic = True
+        #                 context.set_binding_shape(i, tuple(model.get_profile_shape(0, i)[2]))
+        #             if dtype == np.float16:
+        #                 fp16 = True
+        #         else:  # output
+        #             output_names.append(name)
+        #         shape = tuple(context.get_binding_shape(i))
+        #         im = torch.from_numpy(np.empty(shape, dtype=dtype)).to(device)
+        #         bindings[name] = Binding(name, dtype, shape, im, int(im.data_ptr()))
+        #     binding_addrs = OrderedDict((n, d.ptr) for n, d in bindings.items())
+        #     batch_size = bindings['images'].shape[0]  # if dynamic, this is instead max batch size
+        # elif coreml:  # CoreML
+        #     LOGGER.info(f'Loading {w} for CoreML inference...')
+        #     import coremltools as ct
+        #     model = ct.models.MLModel(w)
+        # elif saved_model:  # TF SavedModel
+        #     LOGGER.info(f'Loading {w} for TensorFlow SavedModel inference...')
+        #     import tensorflow as tf
+        #     keras = False  # assume TF1 saved_model
+        #     model = tf.keras.models.load_model(w) if keras else tf.saved_model.load(w)
+        # elif pb:  # GraphDef https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
+        #     LOGGER.info(f'Loading {w} for TensorFlow GraphDef inference...')
+        #     import tensorflow as tf
 
-            def wrap_frozen_graph(gd, inputs, outputs):
-                x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=""), [])  # wrapped
-                ge = x.graph.as_graph_element
-                return x.prune(tf.nest.map_structure(ge, inputs), tf.nest.map_structure(ge, outputs))
+        #     def wrap_frozen_graph(gd, inputs, outputs):
+        #         x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=""), [])  # wrapped
+        #         ge = x.graph.as_graph_element
+        #         return x.prune(tf.nest.map_structure(ge, inputs), tf.nest.map_structure(ge, outputs))
 
-            def gd_outputs(gd):
-                name_list, input_list = [], []
-                for node in gd.node:  # tensorflow.core.framework.node_def_pb2.NodeDef
-                    name_list.append(node.name)
-                    input_list.extend(node.input)
-                return sorted(f'{x}:0' for x in list(set(name_list) - set(input_list)) if not x.startswith('NoOp'))
+        #     def gd_outputs(gd):
+        #         name_list, input_list = [], []
+        #         for node in gd.node:  # tensorflow.core.framework.node_def_pb2.NodeDef
+        #             name_list.append(node.name)
+        #             input_list.extend(node.input)
+        #         return sorted(f'{x}:0' for x in list(set(name_list) - set(input_list)) if not x.startswith('NoOp'))
 
-            gd = tf.Graph().as_graph_def()  # TF GraphDef
-            with open(w, 'rb') as f:
-                gd.ParseFromString(f.read())
-            frozen_func = wrap_frozen_graph(gd, inputs="x:0", outputs=gd_outputs(gd))
-        elif tflite or edgetpu:  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
-            try:  # https://coral.ai/docs/edgetpu/tflite-python/#update-existing-tf-lite-code-for-the-edge-tpu
-                from tflite_runtime.interpreter import Interpreter, load_delegate
-            except ImportError:
-                import tensorflow as tf
-                Interpreter, load_delegate = tf.lite.Interpreter, tf.lite.experimental.load_delegate,
-            if edgetpu:  # TF Edge TPU https://coral.ai/software/#edgetpu-runtime
-                LOGGER.info(f'Loading {w} for TensorFlow Lite Edge TPU inference...')
-                delegate = {
-                    'Linux': 'libedgetpu.so.1',
-                    'Darwin': 'libedgetpu.1.dylib',
-                    'Windows': 'edgetpu.dll'}[platform.system()]
-                interpreter = Interpreter(model_path=w, experimental_delegates=[load_delegate(delegate)])
-            else:  # TFLite
-                LOGGER.info(f'Loading {w} for TensorFlow Lite inference...')
-                interpreter = Interpreter(model_path=w)  # load TFLite model
-            interpreter.allocate_tensors()  # allocate
-            input_details = interpreter.get_input_details()  # inputs
-            output_details = interpreter.get_output_details()  # outputs
-            # load metadata
-            with contextlib.suppress(zipfile.BadZipFile):
-                with zipfile.ZipFile(w, "r") as model:
-                    meta_file = model.namelist()[0]
-                    meta = ast.literal_eval(model.read(meta_file).decode("utf-8"))
-                    stride, names = int(meta['stride']), meta['names']
-        elif tfjs:  # TF.js
-            raise NotImplementedError('ERROR: YOLO TF.js inference is not supported')
-        elif paddle:  # PaddlePaddle
-            LOGGER.info(f'Loading {w} for PaddlePaddle inference...')
-            check_requirements('paddlepaddle-gpu' if cuda else 'paddlepaddle')
-            import paddle.inference as pdi
-            if not Path(w).is_file():  # if not *.pdmodel
-                w = next(Path(w).rglob('*.pdmodel'))  # get *.pdmodel file from *_paddle_model dir
-            weights = Path(w).with_suffix('.pdiparams')
-            config = pdi.Config(str(w), str(weights))
-            if cuda:
-                config.enable_use_gpu(memory_pool_init_size_mb=2048, device_id=0)
-            predictor = pdi.create_predictor(config)
-            input_handle = predictor.get_input_handle(predictor.get_input_names()[0])
-            output_names = predictor.get_output_names()
-        elif triton:  # NVIDIA Triton Inference Server
-            LOGGER.info(f'Using {w} as Triton Inference Server...')
-            check_requirements('tritonclient[all]')
-            from utils.triton import TritonRemoteModel
-            model = TritonRemoteModel(url=w)
-            nhwc = model.runtime.startswith("tensorflow")
+        #     gd = tf.Graph().as_graph_def()  # TF GraphDef
+        #     with open(w, 'rb') as f:
+        #         gd.ParseFromString(f.read())
+        #     frozen_func = wrap_frozen_graph(gd, inputs="x:0", outputs=gd_outputs(gd))
+        # elif tflite or edgetpu:  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
+        #     try:  # https://coral.ai/docs/edgetpu/tflite-python/#update-existing-tf-lite-code-for-the-edge-tpu
+        #         from tflite_runtime.interpreter import Interpreter, load_delegate
+        #     except ImportError:
+        #         import tensorflow as tf
+        #         Interpreter, load_delegate = tf.lite.Interpreter, tf.lite.experimental.load_delegate,
+        #     if edgetpu:  # TF Edge TPU https://coral.ai/software/#edgetpu-runtime
+        #         LOGGER.info(f'Loading {w} for TensorFlow Lite Edge TPU inference...')
+        #         delegate = {
+        #             'Linux': 'libedgetpu.so.1',
+        #             'Darwin': 'libedgetpu.1.dylib',
+        #             'Windows': 'edgetpu.dll'}[platform.system()]
+        #         interpreter = Interpreter(model_path=w, experimental_delegates=[load_delegate(delegate)])
+        #     else:  # TFLite
+        #         LOGGER.info(f'Loading {w} for TensorFlow Lite inference...')
+        #         interpreter = Interpreter(model_path=w)  # load TFLite model
+        #     interpreter.allocate_tensors()  # allocate
+        #     input_details = interpreter.get_input_details()  # inputs
+        #     output_details = interpreter.get_output_details()  # outputs
+        #     # load metadata
+        #     with contextlib.suppress(zipfile.BadZipFile):
+        #         with zipfile.ZipFile(w, "r") as model:
+        #             meta_file = model.namelist()[0]
+        #             meta = ast.literal_eval(model.read(meta_file).decode("utf-8"))
+        #             stride, names = int(meta['stride']), meta['names']
+        # elif tfjs:  # TF.js
+        #     raise NotImplementedError('ERROR: YOLO TF.js inference is not supported')
+        # elif paddle:  # PaddlePaddle
+        #     LOGGER.info(f'Loading {w} for PaddlePaddle inference...')
+        #     check_requirements('paddlepaddle-gpu' if cuda else 'paddlepaddle')
+        #     import paddle.inference as pdi
+        #     if not Path(w).is_file():  # if not *.pdmodel
+        #         w = next(Path(w).rglob('*.pdmodel'))  # get *.pdmodel file from *_paddle_model dir
+        #     weights = Path(w).with_suffix('.pdiparams')
+        #     config = pdi.Config(str(w), str(weights))
+        #     if cuda:
+        #         config.enable_use_gpu(memory_pool_init_size_mb=2048, device_id=0)
+        #     predictor = pdi.create_predictor(config)
+        #     input_handle = predictor.get_input_handle(predictor.get_input_names()[0])
+        #     output_names = predictor.get_output_names()
+        # elif triton:  # NVIDIA Triton Inference Server
+        #     LOGGER.info(f'Using {w} as Triton Inference Server...')
+        #     check_requirements('tritonclient[all]')
+        #     from utils.triton import TritonRemoteModel
+        #     model = TritonRemoteModel(url=w)
+        #     nhwc = model.runtime.startswith("tensorflow")
         else:
             raise NotImplementedError(f'ERROR: {w} is not a supported format')
 

@@ -1,0 +1,87 @@
+# YOLOv9-C (VOC) + CBAMRes
+# - 主分支 neck/head：SPP + 三尺度融合后均插入 CBAMRes（残差门控）
+# - PGI 辅助分支：在 P3/P4/P5 输出（36/40/44 后）也插入 CBAMRes 做分布对齐
+# - Detect：DualDDetect 输入索引已更新为 [PGI(P3,P4,P5), Main(P3,P4,P5)]
+
+nc: 20
+depth_multiple: 1.0
+width_multiple: 1.0
+anchors: 3
+
+backbone:
+  [
+    [-1, 1, Silence, []],                         # 0
+
+    [-1, 1, Conv, [64, 3, 2]],                     # 1 - P1/2
+    [-1, 1, Conv, [128, 3, 2]],                    # 2 - P2/4
+    [-1, 1, RepNCSPELAN4, [256, 128, 64, 1]],      # 3
+    [-1, 1, ADown, [256]],                         # 4 - P3/8
+    [-1, 1, RepNCSPELAN4, [512, 256, 128, 1]],     # 5
+    [-1, 1, ADown, [512]],                         # 6 - P4/16
+    [-1, 1, RepNCSPELAN4, [512, 512, 256, 1]],     # 7
+    [-1, 1, ADown, [512]],                         # 8 - P5/32
+    [-1, 1, RepNCSPELAN4, [512, 512, 256, 1]],     # 9
+  ]
+
+head:
+  [
+    # ------------------------------
+    # main neck/head (with CBAMRes)
+    # ------------------------------
+    [-1, 1, SPPELAN, [512, 256]],                  # 10
+    [-1, 1, CBAMRes, []],                          # 11 (CBAMRes after SPPELAN)
+
+    [-1, 1, nn.Upsample, [None, 2, 'nearest']],    # 12
+    [[-1, 7], 1, Concat, [1]],                     # 13 (P5 -> P4 fuse)
+    [-1, 1, RepNCSPELAN4, [512, 512, 256, 1]],     # 14
+    [-1, 1, CBAMRes, []],                          # 15
+
+    [-1, 1, nn.Upsample, [None, 2, 'nearest']],    # 16
+    [[-1, 5], 1, Concat, [1]],                     # 17 (P4 -> P3 fuse)
+    [-1, 1, RepNCSPELAN4, [256, 256, 128, 1]],     # 18 (P3/8-small)
+    [-1, 1, CBAMRes, []],                          # 19 (Main P3)
+
+    [-1, 1, ADown, [256]],                         # 20 (P3 -> P4 down)
+    [[-1, 15], 1, Concat, [1]],                    # 21 (concat head P4)
+    [-1, 1, RepNCSPELAN4, [512, 512, 256, 1]],     # 22 (P4/16-medium)
+    [-1, 1, CBAMRes, []],                          # 23 (Main P4)
+
+    [-1, 1, ADown, [512]],                         # 24 (P4 -> P5 down)
+    [[-1, 11], 1, Concat, [1]],                    # 25 (concat head P5)
+    [-1, 1, RepNCSPELAN4, [512, 512, 256, 1]],     # 26 (P5/32-large)
+    [-1, 1, CBAMRes, []],                          # 27 (Main P5)
+
+    # ------------------------------
+    # multi-level reversible auxiliary branch (PGI) [ALIGNED with CBAMRes]
+    # ------------------------------
+
+    # routing
+    [5, 1, CBLinear, [[256]]],                     # 28
+    [7, 1, CBLinear, [[256, 512]]],                # 29
+    [9, 1, CBLinear, [[256, 512, 512]]],           # 30
+
+    # conv down
+    [0, 1, Conv, [64, 3, 2]],                      # 31 - P1/2
+    [-1, 1, Conv, [128, 3, 2]],                    # 32 - P2/4
+    [-1, 1, RepNCSPELAN4, [256, 128, 64, 1]],      # 33
+
+    # avg-conv down fuse
+    [-1, 1, ADown, [256]],                         # 34 - P3/8
+    [[28, 29, 30, -1], 1, CBFuse, [[0, 0, 0]]],    # 35
+
+    [-1, 1, RepNCSPELAN4, [512, 256, 128, 1]],     # 36 (PGI P3 pre-out)
+    [-1, 1, CBAMRes, []],                          # 37 (PGI P3 aligned)
+
+    [-1, 1, ADown, [512]],                         # 38 - P4/16
+    [[29, 30, -1], 1, CBFuse, [[1, 1]]],           # 39
+    [-1, 1, RepNCSPELAN4, [512, 512, 256, 1]],     # 40 (PGI P4 pre-out)
+    [-1, 1, CBAMRes, []],                          # 41 (PGI P4 aligned)
+
+    [-1, 1, ADown, [512]],                         # 42 - P5/32
+    [[30, -1], 1, CBFuse, [[2]]],                  # 43
+    [-1, 1, RepNCSPELAN4, [512, 512, 256, 1]],     # 44 (PGI P5 pre-out)
+    [-1, 1, CBAMRes, []],                          # 45 (PGI P5 aligned)
+
+    # detect: [PGI P3,P4,P5,  Main P3,P4,P5]
+    [[37, 41, 45, 19, 23, 27], 1, DualDDetect, [nc]],  # 46
+  ]

@@ -745,6 +745,15 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is ECA:
+            # ECA(channels, k_size=None, gamma=2, b=1)
+            c2 = ch[f]
+            args = [c2, *args]   # 把 channels 补进去
+        elif m in (CBAM, CBAMRes):
+            # CBAM(channels, reduction=16, spatial_kernel=7)
+            # CBAMRes(channels, reduction=16, spatial_kernel=7, scale=0.5)
+            c2 = ch[f]
+            args = [c2, *args]  # 自动把 channels 补到 args 第一个
         elif m is Shortcut:
             c2 = ch[f[0]]
         elif m is ReOrg:
